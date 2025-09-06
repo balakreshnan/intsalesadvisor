@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Live Web - Real-time Voice Chat</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .status {
+            text-align: center;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 10px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        
+        .status.connected {
+            background: rgba(76, 175, 80, 0.3);
+            border: 1px solid #4CAF50;
+        }
+        
+        .status.disconnected {
+            background: rgba(244, 67, 54, 0.3);
+            border: 1px solid #f44336;
+        }
+        
+        .status.listening {
+            background: rgba(255, 193, 7, 0.3);
+            border: 1px solid #FFC107;
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
+        .controls {
+            text-align: center;
+            margin: 30px 0;
+        }
+        
+        button {
+            background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+            border: none;
+            color: white;
+            padding: 15px 30px;
+            margin: 10px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px 0 rgba(31, 38, 135, 0.2);
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px 0 rgba(31, 38, 135, 0.4);
+        }
+        
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .chat-container {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .message {
+            margin: 15px 0;
+            padding: 12px 18px;
+            border-radius: 18px;
+            max-width: 80%;
+            word-wrap: break-word;
+            animation: fadeIn 0.5s ease;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .user-message {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin-left: auto;
+            text-align: right;
+        }
+        
+        .agent-message {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            margin-right: auto;
+        }
+        
+        .transcript {
+            background: rgba(255, 255, 255, 0.1);
+            font-style: italic;
+            border-left: 3px solid #4ECDC4;
+            padding-left: 15px;
+        }
+        
+        .error {
+            background: rgba(244, 67, 54, 0.3);
+            border: 1px solid #f44336;
+            color: #ffcdd2;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 15px 0;
+        }
+        
+        .audio-visualizer {
+            height: 60px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 30px;
+            margin: 20px 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .visualizer-bar {
+            width: 4px;
+            background: linear-gradient(to top, #4ECDC4, #44A08D);
+            margin: 0 2px;
+            border-radius: 2px;
+            transition: height 0.1s ease;
+        }
+        
+        #microphoneButton {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            font-size: 2em;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        #microphoneButton.recording {
+            background: linear-gradient(45deg, #FF6B6B, #FF8E53);
+            animation: pulse 1s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Voice Live Chat</h1>
+        
+        <div id="status" class="status disconnected">
+            Disconnected - Click "Start Session" to begin
+        </div>
+        
+        <div class="controls">
+            <button id="startButton" onclick="startSession()">Start Session</button>
+            <button id="stopButton" onclick="stopSession()" disabled>Stop Session</button>
+        </div>
+        
+        <div class="controls">
+            <button id="microphoneButton" onclick="toggleMicrophone()" disabled>
+                🎤
+            </button>
+        </div>
+        
+        <div class="audio-visualizer" id="visualizer" style="display: none;">
+            <!-- Audio visualization bars will be added here -->
+        </div>
+        
+        <div class="chat-container" id="chatContainer">
+            <div class="message agent-message">
+                👋 Hello! I'm your voice assistant. Start a session and click the microphone to begin talking.
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let socket = null;
+        let mediaRecorder = null;
+        let audioContext = null;
+        let analyser = null;
+        let microphone = null;
+        let isRecording = false;
+        let isSessionActive = false;
+        let audioChunks = [];
+        let playbackAudioContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        
+        // Initialize Socket.IO connection
+        function initializeSocket() {
+            socket = io();
+            
+            socket.on('connect', function() {
+                console.log('Connected to server');
+                updateStatus('Connected - Ready to start session', 'connected');
+                document.getElementById('startButton').disabled = false;
+            });
+            
+            socket.on('disconnect', function() {
+                console.log('Disconnected from server');
+                updateStatus('Disconnected from server', 'disconnected');
+                isSessionActive = false;
+                updateButtons();
+            });
+            
+            socket.on('session_started', function(data) {
+                console.log('Session started:', data);
+                isSessionActive = true;
+                updateStatus('Session active - Click microphone to talk', 'connected');
+                updateButtons();
+            });
+            
+            socket.on('session_error', function(data) {
+                console.log('Session error:', data);
+                addMessage('Error: ' + data.error, 'error');
+                updateStatus('Session error', 'disconnected');
+            });
+            
+            socket.on('transcript', function(data) {
+                console.log('User transcript:', data.text);
+                addMessage('You said: ' + data.text, 'transcript');
+            });
+            
+            socket.on('agent_text', function(data) {
+                console.log('Agent text:', data.text);
+                addMessage(data.text, 'agent-message');
+            });
+            
+            socket.on('agent_audio_transcript', function(data) {
+                console.log('Agent audio transcript:', data.text);
+                addMessage('🔊 ' + data.text, 'agent-message');
+            });
+            
+            socket.on('audio_chunk', function(data) {
+                console.log('Received audio chunk');
+                playAudioChunk(data.audio);
+            });
+            
+            socket.on('speech_started', function() {
+                console.log('Speech started detected');
+                updateStatus('Speech detected...', 'listening');
+            });
+            
+            socket.on('speech_stopped', function() {
+                console.log('Speech stopped detected');
+                updateStatus('Processing...', 'connected');
+            });
+            
+            socket.on('api_error', function(data) {
+                console.log('API error:', data);
+                addMessage('API Error: ' + JSON.stringify(data.error), 'error');
+            });
+        }
+        
+        // Start voice session
+        function startSession() {
+            if (socket) {
+                socket.emit('start_voice_session');
+                updateStatus('Starting session...', 'connected');
+                document.getElementById('startButton').disabled = true;
+            }
+        }
+        
+        // Stop voice session
+        function stopSession() {
+            if (socket) {
+                socket.emit('stop_voice_session');
+                isSessionActive = false;
+                updateStatus('Session stopped', 'disconnected');
+                if (isRecording) {
+                    stopRecording();
+                }
+                updateButtons();
+            }
+        }
+        
+        // Toggle microphone recording
+        async function toggleMicrophone() {
+            if (!isSessionActive) return;
+            
+            if (isRecording) {
+                stopRecording();
+            } else {
+                await startRecording();
+            }
+        }
+        
+        // Start audio recording
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 24000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    } 
+                });
+                
+                // Set up audio context for processing
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                const source = audioContext.createMediaStreamSource(stream);
+                
+                // Create a script processor for real-time audio processing
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = function(event) {
+                    if (!isRecording) return;
+                    
+                    const inputBuffer = event.inputBuffer;
+                    const inputData = inputBuffer.getChannelData(0);
+                    
+                    // Convert float32 to int16 PCM
+                    const pcmData = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        const sample = Math.max(-1, Math.min(1, inputData[i]));
+                        pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                    }
+                    
+                    // Convert to base64 and send
+                    const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+                    if (socket && isRecording) {
+                        socket.emit('audio_data', { audio: base64Audio });
+                    }
+                };
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                // Set up audio visualization
+                analyser = audioContext.createAnalyser();
+                source.connect(analyser);
+                analyser.fftSize = 256;
+                const bufferLength = analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                visualizeAudio(dataArray);
+                
+                isRecording = true;
+                updateButtons();
+                updateStatus('Recording... Speak now!', 'listening');
+                
+                // Store references for cleanup
+                window.currentStream = stream;
+                window.currentProcessor = processor;
+                
+            } catch (error) {
+                console.error('Error starting recording:', error);
+                addMessage('Error accessing microphone: ' + error.message, 'error');
+            }
+        }
+        
+        // Stop audio recording
+        function stopRecording() {
+            if (isRecording) {
+                isRecording = false;
+                
+                // Clean up audio processing
+                if (window.currentProcessor) {
+                    window.currentProcessor.disconnect();
+                    window.currentProcessor = null;
+                }
+                
+                if (window.currentStream) {
+                    window.currentStream.getTracks().forEach(track => track.stop());
+                    window.currentStream = null;
+                }
+                
+                if (audioContext) {
+                    audioContext.close();
+                    audioContext = null;
+                }
+                
+                updateButtons();
+                updateStatus('Processing your speech...', 'connected');
+                
+                // Stop visualization
+                document.getElementById('visualizer').style.display = 'none';
+                
+                // Trigger response from the AI agent
+                if (socket && isSessionActive) {
+                    console.log('Triggering AI response...');
+                    socket.emit('trigger_response');
+                }
+            }
+        }
+        
+        // Visualize audio input
+        function visualizeAudio(dataArray) {
+            if (!isRecording) return;
+            
+            analyser.getByteFrequencyData(dataArray);
+            
+            const visualizer = document.getElementById('visualizer');
+            visualizer.style.display = 'flex';
+            visualizer.innerHTML = '';
+            
+            for (let i = 0; i < 32; i++) {
+                const bar = document.createElement('div');
+                bar.className = 'visualizer-bar';
+                const height = (dataArray[i] / 255) * 50 + 5;
+                bar.style.height = height + 'px';
+                visualizer.appendChild(bar);
+            }
+            
+            requestAnimationFrame(() => visualizeAudio(dataArray));
+        }
+        
+        // Play audio chunk received from server
+        function playAudioChunk(base64Audio) {
+            try {
+                console.log('Playing audio chunk, length:', base64Audio.length);
+                
+                // Initialize playback audio context if not already done
+                if (!playbackAudioContext) {
+                    playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                // Decode base64 to raw PCM data
+                const binaryString = atob(base64Audio);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                // Convert bytes to 16-bit PCM samples
+                const samples = new Int16Array(bytes.buffer);
+                
+                // Create audio buffer for 24kHz mono PCM
+                const sampleRate = 24000;
+                const numberOfChannels = 1;
+                const audioBuffer = playbackAudioContext.createBuffer(
+                    numberOfChannels, 
+                    samples.length, 
+                    sampleRate
+                );
+                
+                // Convert Int16 to Float32 and fill the audio buffer
+                const channelData = audioBuffer.getChannelData(0);
+                for (let i = 0; i < samples.length; i++) {
+                    channelData[i] = samples[i] / 32768.0; // Convert from Int16 to Float32
+                }
+                
+                // Add to queue and play
+                audioQueue.push(audioBuffer);
+                if (!isPlaying) {
+                    playNextAudioChunk();
+                }
+                
+            } catch (error) {
+                console.error('Error playing audio chunk:', error);
+            }
+        }
+        
+        function playNextAudioChunk() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            isPlaying = true;
+            const audioBuffer = audioQueue.shift();
+            
+            const source = playbackAudioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(playbackAudioContext.destination);
+            
+            source.onended = () => {
+                playNextAudioChunk();
+            };
+            
+            source.start();
+        }
+        
+        // Update status display
+        function updateStatus(message, className) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = 'status ' + className;
+        }
+        
+        // Update button states
+        function updateButtons() {
+            const startBtn = document.getElementById('startButton');
+            const stopBtn = document.getElementById('stopButton');
+            const micBtn = document.getElementById('microphoneButton');
+            
+            startBtn.disabled = isSessionActive;
+            stopBtn.disabled = !isSessionActive;
+            micBtn.disabled = !isSessionActive;
+            
+            if (isRecording) {
+                micBtn.className = 'recording';
+                micBtn.textContent = '🔴';
+            } else {
+                micBtn.className = '';
+                micBtn.textContent = '🎤';
+            }
+        }
+        
+        // Add message to chat
+        function addMessage(text, className) {
+            const chatContainer = document.getElementById('chatContainer');
+            const message = document.createElement('div');
+            message.className = 'message ' + className;
+            message.textContent = text;
+            chatContainer.appendChild(message);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        // Initialize when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeSocket();
+        });
+    </script>
+</body>
+</html>
