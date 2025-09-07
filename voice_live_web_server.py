@@ -13,7 +13,11 @@ import threading
 import numpy as np
 import queue
 import asyncio
-import websocket as ws_client
+try:
+    import websocket as ws_client
+except ImportError:
+    print("websocket-client package not installed. Please run: pip install websocket-client")
+    ws_client = None
 from datetime import datetime
 from collections import deque
 
@@ -29,13 +33,19 @@ from voice_live_web import AzureVoiceLive, VoiceLiveConnection, AudioPlayerAsync
 
 load_dotenv()
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key'
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Initialize Flask app
+try:
+    app = Flask(__name__)
+    app.config['SECRET_KEY'] = 'your-secret-key'
+    socketio = SocketIO(app, cors_allowed_origins="*")
+    logger = logging.getLogger(__name__)
+except Exception as e:
+    print(f"Error initializing Flask app: {e}")
+    print("Please ensure Flask and Flask-SocketIO are installed: pip install flask flask-socketio")
+    exit(1)
 
 # Global variables for managing connections
 active_connections = {}
-logger = logging.getLogger(__name__)
 
 class WebVoiceLiveSession:
     """Manages a Voice Live session for web clients"""
@@ -45,9 +55,13 @@ class WebVoiceLiveSession:
         self.connection = None
         self.audio_player = AudioPlayerAsync()
         self.is_active = False
+        self.response_in_progress = False
         
     def start_session(self):
         """Initialize Voice Live API connection"""
+        if ws_client is None:
+            raise ImportError("websocket-client package not installed. Please run: pip install websocket-client")
+            
         try:
             # Get credentials
             endpoint = os.environ.get("AZURE_VOICE_LIVE_ENDPOINT")
@@ -156,9 +170,17 @@ class WebVoiceLiveSession:
                         
                 elif event_type == "response.audio.done":
                     print("Audio response completed")
+                    socketio.emit('response_audio_done', {}, room=self.session_id)
                     
                 elif event_type == "response.done":
                     print("Full response completed")
+                    self.response_in_progress = False
+                    socketio.emit('response_complete', {}, room=self.session_id)
+                
+                elif event_type == "response.created":
+                    print("Response generation started")
+                    self.response_in_progress = True
+                    socketio.emit('response_started', {}, room=self.session_id)
                         
                 elif event_type == "input_audio_buffer.speech_started":
                     socketio.emit('speech_started', {}, room=self.session_id)
@@ -191,7 +213,7 @@ class WebVoiceLiveSession:
     
     def trigger_response(self):
         """Trigger a response from the AI agent"""
-        if self.connection and self.is_active:
+        if self.connection and self.is_active and not self.response_in_progress:
             try:
                 print("Triggering response generation")
                 param = {
@@ -205,14 +227,31 @@ class WebVoiceLiveSession:
                 print("Response trigger sent successfully")
             except Exception as e:
                 print(f"Error triggering response: {e}")
+        elif self.response_in_progress:
+            print("Skipping response trigger - response already in progress")
+        else:
+            print("Cannot trigger response - connection not ready")
     
     def stop_session(self):
         """Stop the Voice Live session"""
         self.is_active = False
+        self.response_in_progress = False
         if self.connection:
             self.connection.close()
         if self.audio_player:
             self.audio_player.terminate()
+    
+    def pause_session(self):
+        """Pause the session without triggering responses"""
+        print(f"Pausing session {self.session_id}")
+        # Don't trigger any new responses when paused
+        pass
+    
+    def resume_session(self):
+        """Resume the session"""
+        print(f"Resuming session {self.session_id}")
+        # Session can now accept new inputs again
+        pass
 
 @app.route('/')
 def index():
@@ -268,6 +307,24 @@ def handle_trigger_response():
     else:
         print(f"No active connection found for session {session_id}")
 
+@socketio.on('pause_session')
+def handle_pause_session():
+    """Pause the session"""
+    session_id = request.sid
+    print(f"Pausing session {session_id}")
+    if session_id in active_connections:
+        active_connections[session_id].pause_session()
+        emit('session_paused', {'status': 'success'})
+
+@socketio.on('resume_session')
+def handle_resume_session():
+    """Resume the session"""
+    session_id = request.sid
+    print(f"Resuming session {session_id}")
+    if session_id in active_connections:
+        active_connections[session_id].resume_session()
+        emit('session_resumed', {'status': 'success'})
+
 @socketio.on('stop_voice_session')
 def handle_stop_session():
     """Stop the Voice Live session"""
@@ -277,7 +334,49 @@ def handle_stop_session():
         del active_connections[session_id]
         emit('session_stopped', {'status': 'success'})
 
+def check_dependencies():
+    """Check if all required dependencies are available"""
+    missing_deps = []
+    
+    # Check websocket-client
+    if ws_client is None:
+        missing_deps.append("websocket-client")
+    
+    # Check Azure libraries
+    try:
+        from azure.identity import DefaultAzureCredential
+    except ImportError:
+        missing_deps.append("azure-identity")
+    
+    # Check Flask libraries
+    try:
+        from flask import Flask
+        from flask_socketio import SocketIO
+    except ImportError:
+        missing_deps.append("flask or flask-socketio")
+    
+    # Check voice_live_web module
+    try:
+        from voice_live_web import AzureVoiceLive, VoiceLiveConnection, AudioPlayerAsync
+    except ImportError:
+        missing_deps.append("voice_live_web module (check if voice_live_web.py exists)")
+    
+    if missing_deps:
+        print("ERROR: Missing dependencies:")
+        for dep in missing_deps:
+            print(f"  - {dep}")
+        print("\nPlease install missing packages using:")
+        print("  pip install websocket-client azure-identity flask flask-socketio")
+        return False
+    
+    return True
+
 if __name__ == '__main__':
+    # Check dependencies first
+    if not check_dependencies():
+        print("Please install missing dependencies before running the server.")
+        exit(1)
+    
     # Create templates directory if it doesn't exist
     os.makedirs('templates', exist_ok=True)
     

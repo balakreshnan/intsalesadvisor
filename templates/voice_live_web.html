@@ -57,6 +57,66 @@
             animation: pulse 1.5s infinite;
         }
         
+        .status.processing {
+            background: rgba(156, 39, 176, 0.3);
+            border: 1px solid #9C27B0;
+            animation: pulse 1.5s infinite;
+        }
+        
+        .agent-status {
+            text-align: center;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 10px;
+            background: rgba(33, 150, 243, 0.2);
+            border: 1px solid #2196F3;
+            transition: all 0.3s ease;
+        }
+        
+        .agent-status.thinking {
+            background: rgba(156, 39, 176, 0.2);
+            border: 1px solid #9C27B0;
+            animation: pulse 1.5s infinite;
+        }
+        
+        .agent-indicator {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            font-weight: bold;
+        }
+        
+        .agent-icon {
+            font-size: 1.5em;
+        }
+        
+        .thinking-dots {
+            display: inline-flex;
+            gap: 3px;
+        }
+        
+        .thinking-dots span {
+            width: 6px;
+            height: 6px;
+            background: #9C27B0;
+            border-radius: 50%;
+            animation: thinking 1.5s infinite;
+        }
+        
+        .thinking-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        
+        .thinking-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        
+        @keyframes thinking {
+            0%, 60%, 100% { transform: scale(1); opacity: 0.7; }
+            30% { transform: scale(1.2); opacity: 1; }
+        }
+        
         @keyframes pulse {
             0% { opacity: 1; }
             50% { opacity: 0.7; }
@@ -91,6 +151,39 @@
             background: #666;
             cursor: not-allowed;
             transform: none;
+        }
+        
+        #pauseButton {
+            background: linear-gradient(45deg, #FF9800, #FF5722);
+        }
+        
+        #resumeButton {
+            background: linear-gradient(45deg, #4CAF50, #8BC34A);
+        }
+        
+        #microphoneButton {
+            font-size: 2em;
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            margin: 20px;
+        }
+        
+        #microphoneButton.recording {
+            animation: pulse 1s infinite;
+            background: linear-gradient(45deg, #f44336, #FF5722);
+        }
+        
+        #microphoneButton.disabled {
+            background: linear-gradient(45deg, #9E9E9E, #757575);
+            cursor: not-allowed;
+        }
+        
+        .microphone-instructions {
+            font-size: 0.9em;
+            color: rgba(255, 255, 255, 0.8);
+            margin-top: 10px;
+            text-align: center;
         }
         
         .chat-container {
@@ -188,16 +281,33 @@
             Disconnected - Click "Start Session" to begin
         </div>
         
+        <div id="agentStatus" class="agent-status" style="display: none;">
+            <div class="agent-indicator">
+                <span class="agent-icon">🤖</span>
+                <span id="agentStatusText">Agent Ready</span>
+                <div class="thinking-dots" id="thinkingDots" style="display: none;">
+                    <span></span><span></span><span></span>
+                </div>
+            </div>
+        </div>
+        
         <div class="controls">
             <button id="startButton" onclick="startSession()">Start Session</button>
             <button id="stopButton" onclick="stopSession()" disabled>Stop Session</button>
+            <button id="pauseButton" onclick="pauseSession()" disabled style="display: none;">⏸️ Pause</button>
+            <button id="resumeButton" onclick="resumeSession()" disabled style="display: none;">▶️ Resume</button>
+            <button id="resetButton" onclick="resetState()" style="display: none;">🔄 Reset</button>
+            <button id="testAudioButton" onclick="testAudio()" style="background: #FF9800;">🔊 Test Audio</button>
+            <button id="noiseReductionButton" onclick="toggleNoiseReduction()" style="background: #4CAF50;">🔇 Noise Filter: ON</button>
         </div>
         
         <div class="controls">
             <button id="microphoneButton" onclick="toggleMicrophone()" disabled>
                 🎤
             </button>
-        </div>
+            <div id="microphoneInstructions" class="microphone-instructions">
+                Click the microphone to start talking
+            </div>
         
         <div class="audio-visualizer" id="visualizer" style="display: none;">
             <!-- Audio visualization bars will be added here -->
@@ -219,10 +329,22 @@
         let microphone = null;
         let isRecording = false;
         let isSessionActive = false;
+        let isPaused = false;
+        let agentProcessing = false;
         let audioChunks = [];
         let playbackAudioContext = null;
         let audioQueue = [];
         let isPlaying = false;
+        let currentAudioBuffer = null;
+        let audioBufferPosition = 0;
+        let audioSampleRate = 24000;
+        let activeAudioSources = []; // Track active audio sources
+        let audioStreamId = 0; // Unique ID for each audio stream
+        let currentStreamId = 0; // Current active stream ID
+        let audioChunkQueue = []; // Queue for ordered audio chunk playback
+        let nextScheduledTime = 0; // Next time to schedule audio
+        let currentResponseId = 0; // ID for current response
+        let noiseReductionEnabled = true; // Enable noise reduction by default
         
         // Initialize Socket.IO connection
         function initializeSocket() {
@@ -245,6 +367,8 @@
                 console.log('Session started:', data);
                 isSessionActive = true;
                 updateStatus('Session active - Click microphone to talk', 'connected');
+                updateAgentStatus('Agent Ready', false);
+                document.getElementById('agentStatus').style.display = 'block';
                 updateButtons();
             });
             
@@ -257,21 +381,51 @@
             socket.on('transcript', function(data) {
                 console.log('User transcript:', data.text);
                 addMessage('You said: ' + data.text, 'transcript');
+                updateAgentStatus('Agent Thinking...', true);
+                agentProcessing = true;
             });
             
             socket.on('agent_text', function(data) {
                 console.log('Agent text:', data.text);
                 addMessage(data.text, 'agent-message');
+                updateAgentStatus('Agent Responding...', true);
             });
             
             socket.on('agent_audio_transcript', function(data) {
                 console.log('Agent audio transcript:', data.text);
                 addMessage('🔊 ' + data.text, 'agent-message');
+                updateAgentStatus('Agent Ready', false);
+                agentProcessing = false;
             });
             
             socket.on('audio_chunk', function(data) {
-                console.log('Received audio chunk');
-                playAudioChunk(data.audio);
+                console.log('Received audio chunk, size:', data.audio ? data.audio.length : 'no audio data');
+                
+                if (!data.audio) {
+                    console.error('No audio data in chunk');
+                    return;
+                }
+                
+                // If this is a new response, clear previous chunks and reset timing
+                if (!agentProcessing) {
+                    console.log('New audio response starting - clearing previous chunks');
+                    stopAllAudio();
+                    audioChunkQueue = [];
+                    currentResponseId = ++audioStreamId;
+                    nextScheduledTime = 0;
+                    updateAgentStatus('Agent Speaking...', true);
+                    agentProcessing = true;
+                }
+                
+                // Add chunk to queue with response ID
+                audioChunkQueue.push({
+                    audio: data.audio,
+                    responseId: currentResponseId,
+                    timestamp: Date.now()
+                });
+                
+                // Process the queue gradually instead of all at once
+                processNextAudioChunk();
             });
             
             socket.on('speech_started', function() {
@@ -281,18 +435,86 @@
             
             socket.on('speech_stopped', function() {
                 console.log('Speech stopped detected');
-                updateStatus('Processing...', 'connected');
+                updateStatus('Processing...', 'processing');
+            });
+            
+            socket.on('response_started', function() {
+                console.log('Response generation started');
+                updateAgentStatus('Agent Thinking...', true);
+                agentProcessing = true;
+                // Stop any current audio and reset for new response
+                stopAllAudio();
+                audioBufferPosition = playbackAudioContext ? playbackAudioContext.currentTime + 0.1 : 0.1;
+            });
+            
+            socket.on('response_audio_done', function() {
+                console.log('Audio response completed');
+                updateAgentStatus('Agent Ready', false);
+                agentProcessing = false;
+                updateStatus('Session active - Click microphone to talk', 'connected');
+            });
+            
+            socket.on('response_complete', function() {
+                console.log('Full response completed');
+                
+                // Process any remaining audio chunks in the queue
+                if (audioChunkQueue.length > 0) {
+                    console.log(`Processing ${audioChunkQueue.length} remaining audio chunks`);
+                    processAudioQueue();
+                }
+                
+                // Wait a bit then update status (give audio time to finish)
+                setTimeout(() => {
+                    updateAgentStatus('Agent Ready', false);
+                    agentProcessing = false;
+                    updateStatus('Session active - Click microphone to talk', 'connected');
+                }, 500);
+            });
+            
+            socket.on('session_paused', function(data) {
+                console.log('Session paused:', data);
+            });
+            
+            socket.on('session_resumed', function(data) {
+                console.log('Session resumed:', data);
             });
             
             socket.on('api_error', function(data) {
                 console.log('API error:', data);
                 addMessage('API Error: ' + JSON.stringify(data.error), 'error');
+                // Reset processing state on error
+                agentProcessing = false;
+                updateAgentStatus('Agent Ready', false);
+                updateButtons();
             });
         }
         
         // Start voice session
         function startSession() {
             if (socket) {
+                // Initialize audio context on user interaction (required by browsers)
+                if (!playbackAudioContext) {
+                    console.log('Initializing audio context on user interaction');
+                    try {
+                        playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        console.log('Audio context created successfully:', playbackAudioContext.state);
+                    } catch (error) {
+                        console.error('Failed to create audio context:', error);
+                        alert('Audio not supported in this browser');
+                        return;
+                    }
+                }
+                
+                // Resume audio context if needed
+                if (playbackAudioContext.state === 'suspended') {
+                    console.log('Resuming audio context');
+                    playbackAudioContext.resume().then(() => {
+                        console.log('Audio context resumed');
+                    }).catch(err => {
+                        console.error('Failed to resume audio context:', err);
+                    });
+                }
+                
                 socket.emit('start_voice_session');
                 updateStatus('Starting session...', 'connected');
                 document.getElementById('startButton').disabled = true;
@@ -304,7 +526,9 @@
             if (socket) {
                 socket.emit('stop_voice_session');
                 isSessionActive = false;
+                isPaused = false;
                 updateStatus('Session stopped', 'disconnected');
+                document.getElementById('agentStatus').style.display = 'none';
                 if (isRecording) {
                     stopRecording();
                 }
@@ -312,9 +536,128 @@
             }
         }
         
+        // Pause voice session
+        function pauseSession() {
+            if (isSessionActive && !isPaused) {
+                isPaused = true;
+                if (isRecording) {
+                    stopRecording();
+                }
+                updateStatus('Session paused', 'processing');
+                updateAgentStatus('Agent Paused', false);
+                updateButtons();
+                
+                // Notify server about pause
+                if (socket) {
+                    socket.emit('pause_session');
+                }
+            }
+        }
+        
+        // Resume voice session
+        function resumeSession() {
+            if (isSessionActive && isPaused) {
+                isPaused = false;
+                updateStatus('Session active - Click microphone to talk', 'connected');
+                updateAgentStatus('Agent Ready', false);
+                updateButtons();
+                
+                // Notify server about resume
+                if (socket) {
+                    socket.emit('resume_session');
+                }
+            }
+        }
+        
+        // Reset state if things get stuck
+        function resetState() {
+            console.log('Resetting state...');
+            agentProcessing = false;
+            isPlaying = false;
+            
+            // Stop all audio
+            stopAllAudio();
+            
+            if (playbackAudioContext) {
+                playbackAudioContext.close();
+                playbackAudioContext = null;
+            }
+            
+            if (isRecording) {
+                stopRecording();
+            }
+            
+            updateAgentStatus('Agent Ready', false);
+            updateStatus('Session active - Click microphone to talk', 'connected');
+            updateButtons();
+            
+            addMessage('🔄 State reset - Ready to continue', 'transcript');
+        }
+        
+        // Test audio functionality
+        function testAudio() {
+            console.log('Testing audio...');
+            
+            // Initialize audio context if needed
+            if (!playbackAudioContext) {
+                try {
+                    playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log('Audio context created for test');
+                } catch (error) {
+                    console.error('Failed to create audio context:', error);
+                    alert('Audio not supported in this browser');
+                    return;
+                }
+            }
+            
+            // Resume if suspended
+            if (playbackAudioContext.state === 'suspended') {
+                playbackAudioContext.resume();
+            }
+            
+            // Create a simple test tone
+            try {
+                const oscillator = playbackAudioContext.createOscillator();
+                const gainNode = playbackAudioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(playbackAudioContext.destination);
+                
+                oscillator.frequency.value = 440; // A4 note
+                gainNode.gain.setValueAtTime(0, playbackAudioContext.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0.1, playbackAudioContext.currentTime + 0.01);
+                gainNode.gain.linearRampToValueAtTime(0, playbackAudioContext.currentTime + 0.5);
+                
+                oscillator.start(playbackAudioContext.currentTime);
+                oscillator.stop(playbackAudioContext.currentTime + 0.5);
+                
+                console.log('Test tone played');
+                alert('If you heard a beep, audio is working!');
+            } catch (error) {
+                console.error('Test audio failed:', error);
+                alert('Audio test failed: ' + error.message);
+            }
+        }
+        
+        // Toggle noise reduction
+        function toggleNoiseReduction() {
+            noiseReductionEnabled = !noiseReductionEnabled;
+            const button = document.getElementById('noiseReductionButton');
+            
+            if (noiseReductionEnabled) {
+                button.textContent = '🔇 Noise Filter: ON';
+                button.style.background = '#4CAF50';
+                console.log('Noise reduction enabled');
+            } else {
+                button.textContent = '🔊 Noise Filter: OFF';
+                button.style.background = '#FF5722';
+                console.log('Noise reduction disabled');
+            }
+        }
+        
         // Toggle microphone recording
         async function toggleMicrophone() {
-            if (!isSessionActive) return;
+            if (!isSessionActive || isPaused) return;
             
             if (isRecording) {
                 stopRecording();
@@ -326,6 +669,9 @@
         // Start audio recording
         async function startRecording() {
             try {
+                // Stop any currently playing audio before starting recording
+                stopAllAudio();
+                
                 const stream = await navigator.mediaDevices.getUserMedia({ 
                     audio: {
                         sampleRate: 24000,
@@ -444,15 +790,154 @@
         }
         
         // Play audio chunk received from server
-        function playAudioChunk(base64Audio) {
-            try {
-                console.log('Playing audio chunk, length:', base64Audio.length);
-                
-                // Initialize playback audio context if not already done
-                if (!playbackAudioContext) {
+        // Stop all currently playing audio
+        function stopAllAudio() {
+            console.log('Stopping all audio sources');
+            
+            // Stop all active audio sources immediately
+            activeAudioSources.forEach(source => {
+                try {
+                    source.stop(0); // Stop immediately
+                } catch (e) {
+                    console.log('Source already stopped or error stopping:', e);
+                }
+            });
+            activeAudioSources = [];
+            
+            // Clear audio queues
+            audioQueue = [];
+            audioChunkQueue = [];
+            isPlaying = false;
+            
+            // Reset timing
+            nextScheduledTime = 0;
+            
+            console.log('All audio stopped, queues cleared');
+        }
+
+        async function processNextAudioChunk() {
+            if (audioChunkQueue.length === 0) return;
+            
+            // Don't play if paused
+            if (isPaused) {
+                console.log('Session paused, not processing audio chunk');
+                return;
+            }
+            
+            // Initialize audio context if needed
+            if (!playbackAudioContext) {
+                try {
                     playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log('Audio context created for chunk processing');
+                } catch (error) {
+                    console.error('Failed to create audio context:', error);
+                    return;
+                }
+            }
+            
+            // Resume if suspended
+            if (playbackAudioContext.state === 'suspended') {
+                await playbackAudioContext.resume();
+            }
+            
+            // Set initial timing if needed
+            if (nextScheduledTime === 0) {
+                nextScheduledTime = playbackAudioContext.currentTime + 0.3; // Longer initial delay
+            }
+            
+            // Process one chunk at a time
+            const chunk = audioChunkQueue.shift();
+            
+            // Skip if this chunk is from an old response
+            if (chunk.responseId !== currentResponseId) {
+                console.log('Skipping chunk from old response');
+                // Process next chunk
+                if (audioChunkQueue.length > 0) {
+                    setTimeout(() => processNextAudioChunk(), 10);
+                }
+                return;
+            }
+            
+            try {
+                const audioBuffer = await createAudioBufferFromChunk(chunk.audio);
+                if (audioBuffer) {
+                    // Ensure we don't schedule too far behind current time
+                    const currentTime = playbackAudioContext.currentTime;
+                    if (nextScheduledTime < currentTime) {
+                        nextScheduledTime = currentTime + 0.05;
+                    }
+                    
+                    scheduleAudioBuffer(audioBuffer, nextScheduledTime);
+                    // Add a small gap between chunks for natural speech rhythm
+                    nextScheduledTime += audioBuffer.duration + 0.005; // 5ms gap
+                    console.log(`Processed chunk, next scheduled time: ${nextScheduledTime.toFixed(3)}`);
+                }
+            } catch (error) {
+                console.error('Error processing audio chunk:', error);
+            }
+            
+            // Process next chunk after a small delay
+            if (audioChunkQueue.length > 0) {
+                setTimeout(() => processNextAudioChunk(), 20);
+            }
+        }
+
+        async function processAudioQueue() {
+            if (audioChunkQueue.length === 0) return;
+            
+            // Don't play if paused
+            if (isPaused) {
+                console.log('Session paused, not processing audio queue');
+                return;
+            }
+            
+            // Initialize audio context if needed
+            if (!playbackAudioContext) {
+                try {
+                    playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log('Audio context created for queue processing');
+                } catch (error) {
+                    console.error('Failed to create audio context:', error);
+                    return;
+                }
+            }
+            
+            // Resume if suspended
+            if (playbackAudioContext.state === 'suspended') {
+                await playbackAudioContext.resume();
+            }
+            
+            // Set initial timing if needed
+            if (nextScheduledTime === 0) {
+                nextScheduledTime = playbackAudioContext.currentTime + 0.2; // Larger initial delay
+            }
+            
+            // Process all queued chunks
+            while (audioChunkQueue.length > 0) {
+                const chunk = audioChunkQueue.shift();
+                
+                // Skip if this chunk is from an old response
+                if (chunk.responseId !== currentResponseId) {
+                    console.log('Skipping chunk from old response');
+                    continue;
                 }
                 
+                try {
+                    const audioBuffer = await createAudioBufferFromChunk(chunk.audio);
+                    if (audioBuffer) {
+                        scheduleAudioBuffer(audioBuffer, nextScheduledTime);
+                        // No overlap - play chunks back to back for smooth speech
+                        nextScheduledTime += audioBuffer.duration;
+                        console.log(`Scheduled chunk duration: ${audioBuffer.duration}s, next start: ${nextScheduledTime}`);
+                    }
+                } catch (error) {
+                    console.error('Error processing audio chunk:', error);
+                }
+            }
+        }
+
+        async function createAudioBufferFromChunk(base64Audio) {
+            try {
                 // Decode base64 to raw PCM data
                 const binaryString = atob(base64Audio);
                 const bytes = new Uint8Array(binaryString.length);
@@ -463,50 +948,239 @@
                 // Convert bytes to 16-bit PCM samples
                 const samples = new Int16Array(bytes.buffer);
                 
+                if (samples.length === 0) {
+                    console.log('Empty audio chunk, skipping');
+                    return null;
+                }
+                
                 // Create audio buffer for 24kHz mono PCM
-                const sampleRate = 24000;
-                const numberOfChannels = 1;
-                const audioBuffer = playbackAudioContext.createBuffer(
-                    numberOfChannels, 
-                    samples.length, 
-                    sampleRate
-                );
+                const audioBuffer = playbackAudioContext.createBuffer(1, samples.length, audioSampleRate);
                 
-                // Convert Int16 to Float32 and fill the audio buffer
+                // Convert Int16 to Float32 and apply noise reduction
                 const channelData = audioBuffer.getChannelData(0);
+                
+                // First pass: basic conversion and noise gate
+                const noiseThreshold = 0.02; // Threshold below which we consider it noise
                 for (let i = 0; i < samples.length; i++) {
-                    channelData[i] = samples[i] / 32768.0; // Convert from Int16 to Float32
+                    // Normalize from 16-bit integer to float (-1.0 to 1.0)
+                    let sample = samples[i] / 32767.0;
+                    
+                    // Simple noise gate - reduce very quiet samples
+                    if (Math.abs(sample) < noiseThreshold) {
+                        sample *= 0.3; // Reduce noise floor
+                    }
+                    
+                    // Apply gentle limiting to prevent distortion
+                    if (sample > 0.95) sample = 0.95;
+                    if (sample < -0.95) sample = -0.95;
+                    
+                    channelData[i] = sample;
                 }
                 
-                // Add to queue and play
-                audioQueue.push(audioBuffer);
-                if (!isPlaying) {
-                    playNextAudioChunk();
+                // Second pass: apply simple moving average for noise reduction
+                const windowSize = 3; // Small window to preserve speech quality
+                const smoothedData = new Float32Array(channelData.length);
+                
+                for (let i = 0; i < channelData.length; i++) {
+                    let sum = 0;
+                    let count = 0;
+                    
+                    // Calculate moving average
+                    for (let j = Math.max(0, i - windowSize); j <= Math.min(channelData.length - 1, i + windowSize); j++) {
+                        sum += channelData[j];
+                        count++;
+                    }
+                    
+                    const average = sum / count;
+                    
+                    // Blend original with smoothed (preserve speech clarity)
+                    smoothedData[i] = channelData[i] * 0.7 + average * 0.3;
                 }
+                
+                // Copy smoothed data back
+                audioBuffer.copyToChannel(smoothedData, 0);
+                
+                // Apply very gentle fade in/out only at the edges to prevent clicks
+                const fadeLength = Math.min(16, samples.length / 40); // Even smaller fade
+                
+                // Very gentle fade in (only first few samples)
+                for (let i = 0; i < fadeLength; i++) {
+                    const fadeFactor = Math.sin((i / fadeLength) * Math.PI * 0.5); // Smooth sine fade
+                    smoothedData[i] *= fadeFactor;
+                }
+                
+                // Very gentle fade out (only last few samples)
+                for (let i = samples.length - fadeLength; i < samples.length; i++) {
+                    const fadeFactor = Math.sin(((samples.length - i) / fadeLength) * Math.PI * 0.5);
+                    smoothedData[i] *= fadeFactor;
+                }
+                
+                // Copy final data to buffer
+                audioBuffer.copyToChannel(smoothedData, 0);
+                
+                console.log(`Created clean audio buffer: ${audioBuffer.duration.toFixed(3)}s, ${samples.length} samples`);
+                return audioBuffer;
                 
             } catch (error) {
-                console.error('Error playing audio chunk:', error);
+                console.error('Error creating audio buffer:', error);
+                return null;
+            }
+        }
+
+        function scheduleAudioBuffer(audioBuffer, startTime) {
+            try {
+                const source = playbackAudioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                
+                // Add to active sources for tracking
+                activeAudioSources.push(source);
+                
+                if (noiseReductionEnabled) {
+                    // Create comprehensive audio processing chain for noise reduction
+                    const preGainNode = playbackAudioContext.createGain();
+                    const highPassFilter = playbackAudioContext.createBiquadFilter();
+                    const lowPassFilter = playbackAudioContext.createBiquadFilter();
+                    const notchFilter1 = playbackAudioContext.createBiquadFilter();
+                    const notchFilter2 = playbackAudioContext.createBiquadFilter();
+                    const compressor = playbackAudioContext.createDynamicsCompressor();
+                    const finalGainNode = playbackAudioContext.createGain();
+                    
+                    // Pre-gain for input level control
+                    preGainNode.gain.value = 1.0;
+                    
+                    // High-pass filter to remove low-frequency noise (AC hum, rumble)
+                    highPassFilter.type = 'highpass';
+                    highPassFilter.frequency.setValueAtTime(80, startTime); // Remove below 80Hz
+                    highPassFilter.Q.setValueAtTime(0.7, startTime);
+                    
+                    // Low-pass filter to remove high-frequency noise and artifacts
+                    lowPassFilter.type = 'lowpass';
+                    lowPassFilter.frequency.setValueAtTime(7000, startTime); // Remove above 7kHz
+                    lowPassFilter.Q.setValueAtTime(0.8, startTime);
+                    
+                    // Notch filters to remove specific noise frequencies
+                    // Remove 50Hz/60Hz electrical hum
+                    notchFilter1.type = 'notch';
+                    notchFilter1.frequency.setValueAtTime(60, startTime); // 60Hz hum
+                    notchFilter1.Q.setValueAtTime(10, startTime); // Narrow notch
+                    
+                    // Remove high-frequency whine/noise
+                    notchFilter2.type = 'notch';
+                    notchFilter2.frequency.setValueAtTime(15000, startTime); // High frequency noise
+                    notchFilter2.Q.setValueAtTime(5, startTime);
+                    
+                    // Dynamic compressor for noise gating and smooth levels
+                    compressor.threshold.setValueAtTime(-35, startTime); // Lower threshold for noise gating
+                    compressor.knee.setValueAtTime(15, startTime);
+                    compressor.ratio.setValueAtTime(4, startTime); // Moderate compression
+                    compressor.attack.setValueAtTime(0.005, startTime); // Fast attack for noise
+                    compressor.release.setValueAtTime(0.2, startTime); // Slower release for smooth speech
+                    
+                    // Final gain control
+                    finalGainNode.gain.value = 0.85; // Slightly lower to prevent clipping after processing
+                    
+                    // Connect the complete audio processing chain
+                    source.connect(preGainNode);
+                    preGainNode.connect(highPassFilter);
+                    highPassFilter.connect(notchFilter1);
+                    notchFilter1.connect(lowPassFilter);
+                    lowPassFilter.connect(notchFilter2);
+                    notchFilter2.connect(compressor);
+                    compressor.connect(finalGainNode);
+                    finalGainNode.connect(playbackAudioContext.destination);
+                    
+                    source.onended = () => {
+                        // Remove from active sources
+                        const index = activeAudioSources.indexOf(source);
+                        if (index > -1) {
+                            activeAudioSources.splice(index, 1);
+                        }
+                        
+                        // Clean up all nodes
+                        try {
+                            source.disconnect();
+                            preGainNode.disconnect();
+                            highPassFilter.disconnect();
+                            lowPassFilter.disconnect();
+                            notchFilter1.disconnect();
+                            notchFilter2.disconnect();
+                            compressor.disconnect();
+                            finalGainNode.disconnect();
+                        } catch (e) {
+                            // Already disconnected
+                        }
+                    };
+                } else {
+                    // Simple processing chain without noise reduction
+                    const gainNode = playbackAudioContext.createGain();
+                    gainNode.gain.value = 0.9;
+                    
+                    source.connect(gainNode);
+                    gainNode.connect(playbackAudioContext.destination);
+                    
+                    source.onended = () => {
+                        // Remove from active sources
+                        const index = activeAudioSources.indexOf(source);
+                        if (index > -1) {
+                            activeAudioSources.splice(index, 1);
+                        }
+                        
+                        // Clean up
+                        try {
+                            source.disconnect();
+                            gainNode.disconnect();
+                        } catch (e) {
+                            // Already disconnected
+                        }
+                    };
+                }
+                
+                console.log(`Scheduling ${noiseReductionEnabled ? 'clean' : 'raw'} audio buffer at time ${startTime.toFixed(3)}, duration ${audioBuffer.duration.toFixed(3)}s`);
+                
+                // Schedule the audio to start at the specified time
+                source.start(startTime);
+                
+            } catch (error) {
+                console.error('Error scheduling audio buffer:', error);
             }
         }
         
+        // Old playAudioChunk and playAudioBufferImmediate functions removed
+        // Now using processAudioQueue system for proper chunk sequencing
+        
         function playNextAudioChunk() {
+            // This function is now simplified since we use immediate playback
+            // Keep it for compatibility but most logic moved to playAudioBufferImmediate
             if (audioQueue.length === 0) {
                 isPlaying = false;
+                agentProcessing = false;
+                updateAgentStatus('Agent Ready', false);
                 return;
             }
             
-            isPlaying = true;
-            const audioBuffer = audioQueue.shift();
+            // Check if audio context is still valid
+            if (!playbackAudioContext || playbackAudioContext.state === 'closed') {
+                console.log('Audio context invalid, clearing queue');
+                audioQueue = [];
+                isPlaying = false;
+                agentProcessing = false;
+                updateAgentStatus('Agent Ready', false);
+                return;
+            }
             
-            const source = playbackAudioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(playbackAudioContext.destination);
-            
-            source.onended = () => {
-                playNextAudioChunk();
-            };
-            
-            source.start();
+            try {
+                isPlaying = true;
+                const audioBuffer = audioQueue.shift();
+                playAudioBufferImmediate(audioBuffer);
+                
+                // Continue with next chunk
+                setTimeout(() => playNextAudioChunk(), 10);
+                
+            } catch (error) {
+                console.error('Error in playNextAudioChunk:', error);
+                // Continue with next chunk despite error
+                setTimeout(() => playNextAudioChunk(), 100);
+            }
         }
         
         // Update status display
@@ -516,22 +1190,74 @@
             status.className = 'status ' + className;
         }
         
+        // Update agent status display
+        function updateAgentStatus(message, isThinking) {
+            const agentStatusText = document.getElementById('agentStatusText');
+            const thinkingDots = document.getElementById('thinkingDots');
+            const agentStatus = document.getElementById('agentStatus');
+            
+            agentStatusText.textContent = message;
+            
+            if (isThinking) {
+                thinkingDots.style.display = 'inline-flex';
+                agentStatus.className = 'agent-status thinking';
+            } else {
+                thinkingDots.style.display = 'none';
+                agentStatus.className = 'agent-status';
+            }
+        }
+        
         // Update button states
         function updateButtons() {
             const startBtn = document.getElementById('startButton');
             const stopBtn = document.getElementById('stopButton');
+            const pauseBtn = document.getElementById('pauseButton');
+            const resumeBtn = document.getElementById('resumeButton');
+            const resetBtn = document.getElementById('resetButton');
             const micBtn = document.getElementById('microphoneButton');
+            const instructions = document.getElementById('microphoneInstructions');
             
             startBtn.disabled = isSessionActive;
             stopBtn.disabled = !isSessionActive;
-            micBtn.disabled = !isSessionActive;
             
+            // Microphone button logic
+            const micDisabled = !isSessionActive || isPaused || agentProcessing;
+            micBtn.disabled = micDisabled;
+            
+            if (isSessionActive) {
+                pauseBtn.style.display = isPaused ? 'none' : 'inline-block';
+                resumeBtn.style.display = isPaused ? 'inline-block' : 'none';
+                resetBtn.style.display = 'inline-block';
+                pauseBtn.disabled = false;
+                resumeBtn.disabled = false;
+                resetBtn.disabled = false;
+            } else {
+                pauseBtn.style.display = 'none';
+                resumeBtn.style.display = 'none';
+                resetBtn.style.display = 'none';
+            }
+            
+            // Update microphone button and instructions
             if (isRecording) {
                 micBtn.className = 'recording';
                 micBtn.textContent = '🔴';
+                instructions.textContent = 'Recording... Click to stop';
+            } else if (!isSessionActive) {
+                micBtn.className = '';
+                micBtn.textContent = '🎤';
+                instructions.textContent = 'Start a session first';
+            } else if (isPaused) {
+                micBtn.className = 'disabled';
+                micBtn.textContent = '⏸️';
+                instructions.textContent = 'Session paused - Resume to continue';
+            } else if (agentProcessing) {
+                micBtn.className = 'disabled';
+                micBtn.textContent = '🤖';
+                instructions.textContent = 'Agent is responding... Please wait';
             } else {
                 micBtn.className = '';
                 micBtn.textContent = '🎤';
+                instructions.textContent = 'Click to start talking';
             }
         }
         
@@ -548,6 +1274,26 @@
         // Initialize when page loads
         document.addEventListener('DOMContentLoaded', function() {
             initializeSocket();
+            updateButtons();
+            
+            // Add keyboard shortcuts
+            document.addEventListener('keydown', function(event) {
+                if (event.code === 'Space' && !isRecording) {
+                    event.preventDefault();
+                    if (isSessionActive && !isPaused && !agentProcessing) {
+                        toggleMicrophone();
+                    }
+                } else if (event.code === 'KeyP' && event.ctrlKey) {
+                    event.preventDefault();
+                    if (isSessionActive) {
+                        if (isPaused) {
+                            resumeSession();
+                        } else {
+                            pauseSession();
+                        }
+                    }
+                }
+            });
         });
     </script>
 </body>
