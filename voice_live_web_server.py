@@ -51,11 +51,23 @@ class WebVoiceLiveSession:
     """Manages a Voice Live session for web clients"""
     
     def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.connection = None
+        """Initialize state for a single web client session."""
+        self.session_id: str = session_id
+        self.connection: VoiceLiveConnection | None = None
         self.audio_player = AudioPlayerAsync()
-        self.is_active = False
-        self.response_in_progress = False
+        self.is_active: bool = False
+        self.response_in_progress: bool = False
+
+        # Audio delta aggregation for smoother client playback
+        self._audio_delta_accum: list[str] = []      # base64 delta fragments
+        self._audio_accum_bytes: int = 0             # accumulated decoded bytes
+        self._audio_first_delta_time: float | None = None
+
+        # Tunable aggregation parameters (can be adjusted for latency vs smoothness)
+        self.AGG_TARGET_MS: int = 120        # desired buffered duration before emit
+        self.AGG_MAX_WAIT_MS: int = 70       # max wait after first small chunk
+        self.AGG_MAX_BYTES: int = (24000 // 1000) * 2 * 160  # ~160ms @24kHz 16-bit mono
+        self._assumed_sample_rate: int = 24000
         
     def start_session(self):
         """Initialize Voice Live API connection"""
@@ -163,18 +175,25 @@ class WebVoiceLiveSession:
                     # Send audio data back to client for playback
                     audio_data = event.get("delta", "")
                     if audio_data:
-                        print(f"Received audio delta from Voice Live API, length: {len(audio_data)}")
-                        socketio.emit('audio_chunk', {'audio': audio_data}, room=self.session_id)
+                        try:
+                            self._accumulate_or_emit_delta(audio_data)
+                        except Exception as agg_err:
+                            print(f"Aggregation error, falling back direct emit: {agg_err}")
+                            socketio.emit('audio_chunk', {'audio': audio_data}, room=self.session_id)
                     else:
                         print("Received empty audio delta")
                         
                 elif event_type == "response.audio.done":
                     print("Audio response completed")
+                    # Flush any remaining aggregated audio
+                    self._flush_audio_accum(force=True)
                     socketio.emit('response_audio_done', {}, room=self.session_id)
                     
                 elif event_type == "response.done":
                     print("Full response completed")
                     self.response_in_progress = False
+                    # Safety flush
+                    self._flush_audio_accum(force=True)
                     socketio.emit('response_complete', {}, room=self.session_id)
                 
                 elif event_type == "response.created":
@@ -195,6 +214,65 @@ class WebVoiceLiveSession:
             except Exception as e:
                 print(f"Error in response listener: {e}")
                 time.sleep(0.1)
+
+    def _accumulate_or_emit_delta(self, b64_chunk: str):
+        """Aggregate small audio delta chunks into larger packets to reduce client-side gaps.
+
+        Strategy:
+          - Collect sequential deltas until we approximate target duration (AGG_TARGET_MS) or reach byte cap.
+          - If first chunk is small and no follow-up within AGG_MAX_WAIT_MS, flush early (low-latency bias).
+          - On large single chunk, emit immediately.
+        """
+        # Decode length (avoid keeping decoded data until flush for memory efficiency)
+        try:
+            decoded = base64.b64decode(b64_chunk)
+        except Exception:
+            # If decode fails, emit original to avoid loss
+            socketio.emit('audio_chunk', {'audio': b64_chunk}, room=self.session_id)
+            return
+
+        decoded_len = len(decoded)
+        # Heuristic: if chunk already large enough (~>90ms), emit directly to reduce latency
+        bytes_per_ms = (self._assumed_sample_rate * 2) / 1000  # 2 bytes per sample
+        est_ms = decoded_len / bytes_per_ms
+        now = time.time()
+
+        if est_ms >= self.AGG_TARGET_MS * 0.75 and not self._audio_delta_accum:
+            # Emit directly
+            socketio.emit('audio_chunk', {'audio': b64_chunk}, room=self.session_id)
+            return
+
+        # Accumulate
+        self._audio_delta_accum.append(b64_chunk)
+        self._audio_accum_bytes += decoded_len
+        if self._audio_first_delta_time is None:
+            self._audio_first_delta_time = now
+
+        accumulated_ms = self._audio_accum_bytes / bytes_per_ms
+        waited_ms = (now - self._audio_first_delta_time) * 1000 if self._audio_first_delta_time else 0
+
+        # Flush conditions
+        if (accumulated_ms >= self.AGG_TARGET_MS) or (self._audio_accum_bytes >= self.AGG_MAX_BYTES) or (waited_ms >= self.AGG_MAX_WAIT_MS):
+            self._flush_audio_accum()
+
+    def _flush_audio_accum(self, force: bool = False):
+        if not self._audio_delta_accum:
+            return
+        if not force and len(self._audio_delta_accum) == 1:
+            # Single small chunk; if not forcing and not meeting criteria, let accumulate
+            return
+        try:
+            raw = b''.join(base64.b64decode(c) for c in self._audio_delta_accum)
+            merged_b64 = base64.b64encode(raw).decode('ascii')
+            socketio.emit('audio_chunk', {'audio': merged_b64}, room=self.session_id)
+        except Exception as e:
+            print(f"Failed merging audio deltas: {e}. Emitting individually.")
+            for c in self._audio_delta_accum:
+                socketio.emit('audio_chunk', {'audio': c}, room=self.session_id)
+        finally:
+            self._audio_delta_accum.clear()
+            self._audio_accum_bytes = 0
+            self._audio_first_delta_time = None
     
     def send_audio(self, audio_data: str):
         """Send audio data to Voice Live API"""

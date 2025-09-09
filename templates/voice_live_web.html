@@ -195,6 +195,16 @@
             overflow-y: auto;
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
+    /* Added: two-column layout and agent transcript panel */
+    .conversation-layout { display: flex; flex-direction: row; gap: 20px; align-items: stretch; }
+    .left-pane { flex: 2 1 60%; display: flex; flex-direction: column; }
+    .right-pane { flex: 1 1 40%; display: flex; flex-direction: column; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 15px; padding: 16px 14px 12px 16px; margin-top: 20px; position: relative; max-height: 400px; }
+    .agent-transcript-header { font-weight:600; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; font-size:0.95em; letter-spacing:.5px; }
+    .agent-transcript-list { overflow-y:auto; flex:1 1 auto; padding-right:6px; scrollbar-width:thin; }
+    .agent-line { font-size:0.88em; line-height:1.25em; background:linear-gradient(135deg,#f093fb33 0%, #f5576c33 100%); border-left:3px solid #f5576c; padding:6px 10px; margin-bottom:8px; border-radius:8px; word-break:break-word; animation:fadeIn 0.4s ease; }
+    .agent-line time { display:block; font-size:0.65em; opacity:0.65; margin-top:4px; }
+    .clear-transcript-btn { background:#9C27B0; padding:4px 10px; margin:0; font-size:0.7em; border-radius:20px; box-shadow:none; }
+    .clear-transcript-btn:hover { box-shadow:0 0 6px rgba(255,255,255,0.3); }
         
         .message {
             margin: 15px 0;
@@ -313,9 +323,20 @@
             <!-- Audio visualization bars will be added here -->
         </div>
         
-        <div class="chat-container" id="chatContainer">
-            <div class="message agent-message">
-                👋 Hello! I'm your voice assistant. Start a session and click the microphone to begin talking.
+        <div class="conversation-layout">
+            <div class="left-pane">
+                <div class="chat-container" id="chatContainer">
+                    <div class="message agent-message">
+                        👋 Hello! I'm your voice assistant. Start a session and click the microphone to begin talking.
+                    </div>
+                </div>
+            </div>
+            <div class="right-pane" id="agentTranscriptPane">
+                <div class="agent-transcript-header">
+                    <span>🗒️ Agent Transcript</span>
+                    <button class="clear-transcript-btn" onclick="clearAgentTranscript()" title="Clear transcript">Clear</button>
+                </div>
+                <div class="agent-transcript-list" id="agentTranscriptList"></div>
             </div>
         </div>
     </div>
@@ -345,6 +366,16 @@
         let nextScheduledTime = 0; // Next time to schedule audio
         let currentResponseId = 0; // ID for current response
         let noiseReductionEnabled = true; // Enable noise reduction by default
+    // New smoothing helpers
+    let prevChunkTail = null; // Tail samples from previous chunk for cross-fade
+    let targetSampleRate = null; // Will adopt AudioContext sample rate (often 48000) to avoid per-chunk resample artifacts
+    const CROSS_FADE_MS = 6; // Cross-fade duration in milliseconds
+    const MIN_LEAD_TIME = 0.18; // Seconds of lead scheduling to avoid underruns
+    // Prebuffering for smoother playback
+    let prebufferSeconds = 0.5; // Amount of audio to accumulate before starting playback
+    let playbackStartedForCurrentResponse = false;
+    let bufferedDuration = 0; // Accumulated decoded audio duration (seconds)
+    let decodedChunkQueue = []; // Holds decoded AudioBuffers awaiting initial start
         
         // Initialize Socket.IO connection
         function initializeSocket() {
@@ -389,6 +420,7 @@
                 console.log('Agent text:', data.text);
                 addMessage(data.text, 'agent-message');
                 updateAgentStatus('Agent Responding...', true);
+                appendAgentTranscript(data.text, false);
             });
             
             socket.on('agent_audio_transcript', function(data) {
@@ -396,6 +428,7 @@
                 addMessage('🔊 ' + data.text, 'agent-message');
                 updateAgentStatus('Agent Ready', false);
                 agentProcessing = false;
+                appendAgentTranscript(data.text, true);
             });
             
             socket.on('audio_chunk', function(data) {
@@ -413,6 +446,10 @@
                     audioChunkQueue = [];
                     currentResponseId = ++audioStreamId;
                     nextScheduledTime = 0;
+                    // Reset prebuffer state
+                    playbackStartedForCurrentResponse = false;
+                    bufferedDuration = 0;
+                    decodedChunkQueue = [];
                     updateAgentStatus('Agent Speaking...', true);
                     agentProcessing = true;
                 }
@@ -457,8 +494,11 @@
             socket.on('response_complete', function() {
                 console.log('Full response completed');
                 
-                // Process any remaining audio chunks in the queue
-                if (audioChunkQueue.length > 0) {
+                // If playback hasn't started yet (short response), start it now with buffered audio
+                if (!playbackStartedForCurrentResponse && (decodedChunkQueue.length > 0 || audioChunkQueue.length > 0)) {
+                    console.log('Response complete before playback start - forcing playback of buffered audio');
+                    forceStartBufferedPlayback();
+                } else if (audioChunkQueue.length > 0) {
                     console.log(`Processing ${audioChunkQueue.length} remaining audio chunks`);
                     processAudioQueue();
                 }
@@ -811,6 +851,9 @@
             
             // Reset timing
             nextScheduledTime = 0;
+            playbackStartedForCurrentResponse = false;
+            bufferedDuration = 0;
+            decodedChunkQueue = [];
             
             console.log('All audio stopped, queues cleared');
         }
@@ -861,16 +904,24 @@
             try {
                 const audioBuffer = await createAudioBufferFromChunk(chunk.audio);
                 if (audioBuffer) {
-                    // Ensure we don't schedule too far behind current time
-                    const currentTime = playbackAudioContext.currentTime;
-                    if (nextScheduledTime < currentTime) {
-                        nextScheduledTime = currentTime + 0.05;
+                    if (!playbackStartedForCurrentResponse) {
+                        // Buffer until we have enough duration
+                        decodedChunkQueue.push(audioBuffer);
+                        bufferedDuration += audioBuffer.duration;
+                        console.log(`Buffered chunk (${audioBuffer.duration.toFixed(3)}s). Total buffered: ${bufferedDuration.toFixed(3)}s / target ${prebufferSeconds}s`);
+                        if (bufferedDuration >= prebufferSeconds) {
+                            console.log('Prebuffer threshold reached - starting playback');
+                            startBufferedPlayback();
+                        }
+                    } else {
+                        // Playback already started - schedule immediately in sequence
+                        const currentTime = playbackAudioContext.currentTime;
+                        if (nextScheduledTime < currentTime + 0.02) {
+                            nextScheduledTime = currentTime + 0.05; // catch up if fell behind
+                        }
+                        scheduleAudioBuffer(audioBuffer, nextScheduledTime);
+                        nextScheduledTime += audioBuffer.duration; // no artificial gap when using cross-fade
                     }
-                    
-                    scheduleAudioBuffer(audioBuffer, nextScheduledTime);
-                    // Add a small gap between chunks for natural speech rhythm
-                    nextScheduledTime += audioBuffer.duration + 0.005; // 5ms gap
-                    console.log(`Processed chunk, next scheduled time: ${nextScheduledTime.toFixed(3)}`);
                 }
             } catch (error) {
                 console.error('Error processing audio chunk:', error);
@@ -925,223 +976,182 @@
                 try {
                     const audioBuffer = await createAudioBufferFromChunk(chunk.audio);
                     if (audioBuffer) {
-                        scheduleAudioBuffer(audioBuffer, nextScheduledTime);
-                        // No overlap - play chunks back to back for smooth speech
-                        nextScheduledTime += audioBuffer.duration;
+                        if (!playbackStartedForCurrentResponse) {
+                            decodedChunkQueue.push(audioBuffer);
+                            bufferedDuration += audioBuffer.duration;
+                        } else {
+                            scheduleAudioBuffer(audioBuffer, nextScheduledTime);
+                            nextScheduledTime += audioBuffer.duration;
+                        }
                         console.log(`Scheduled chunk duration: ${audioBuffer.duration}s, next start: ${nextScheduledTime}`);
                     }
                 } catch (error) {
                     console.error('Error processing audio chunk:', error);
                 }
             }
+
+            if (!playbackStartedForCurrentResponse && decodedChunkQueue.length > 0) {
+                console.log('Starting playback after processing full queue (response complete)');
+                startBufferedPlayback();
+            }
+        }
+
+        function startBufferedPlayback() {
+            if (decodedChunkQueue.length === 0) return;
+            playbackStartedForCurrentResponse = true;
+            if (!playbackAudioContext) return;
+            if (nextScheduledTime === 0) {
+                nextScheduledTime = playbackAudioContext.currentTime + 0.25; // initial lead
+            }
+            console.log(`Starting buffered playback with ${decodedChunkQueue.length} chunks totaling ${bufferedDuration.toFixed(3)}s`);
+            while (decodedChunkQueue.length > 0) {
+                const buf = decodedChunkQueue.shift();
+                scheduleAudioBuffer(buf, nextScheduledTime);
+                nextScheduledTime += buf.duration; // contiguous scheduling
+            }
+        }
+
+        function forceStartBufferedPlayback() {
+            // Use when response completes before threshold
+            if (playbackStartedForCurrentResponse) return;
+            if (decodedChunkQueue.length === 0) return;
+            console.log('Force starting playback (short response)');
+            startBufferedPlayback();
         }
 
         async function createAudioBufferFromChunk(base64Audio) {
             try {
-                // Decode base64 to raw PCM data
+                // 1. Decode base64 -> bytes
                 const binaryString = atob(base64Audio);
                 const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-                
-                // Convert bytes to 16-bit PCM samples
-                const samples = new Int16Array(bytes.buffer);
-                
-                if (samples.length === 0) {
-                    console.log('Empty audio chunk, skipping');
-                    return null;
-                }
-                
-                // Create audio buffer for 24kHz mono PCM
-                const audioBuffer = playbackAudioContext.createBuffer(1, samples.length, audioSampleRate);
-                
-                // Convert Int16 to Float32 and apply noise reduction
-                const channelData = audioBuffer.getChannelData(0);
-                
-                // First pass: basic conversion and noise gate
-                const noiseThreshold = 0.02; // Threshold below which we consider it noise
-                for (let i = 0; i < samples.length; i++) {
-                    // Normalize from 16-bit integer to float (-1.0 to 1.0)
-                    let sample = samples[i] / 32767.0;
-                    
-                    // Simple noise gate - reduce very quiet samples
-                    if (Math.abs(sample) < noiseThreshold) {
-                        sample *= 0.3; // Reduce noise floor
+                for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+
+                // 2. Int16 PCM (24kHz mono)
+                const pcm16 = new Int16Array(bytes.buffer);
+                if (pcm16.length === 0) return null;
+
+                // 3. Ensure target sample rate matches AudioContext (prevents per-chunk resample clicks)
+                if (!targetSampleRate) targetSampleRate = playbackAudioContext.sampleRate; // usually 44100 or 48000
+                const srcRate = audioSampleRate; // 24000
+                let floatData = new Float32Array(pcm16.length);
+                for (let i = 0; i < pcm16.length; i++) floatData[i] = Math.max(-1, Math.min(1, pcm16[i] / 32768));
+
+                // 4. Optional light denoise (remove DC & very low amplitude hiss without gating)
+                let mean = 0;
+                for (let v of floatData) mean += v; mean /= floatData.length;
+                for (let i = 0; i < floatData.length; i++) floatData[i] -= mean; // DC offset removal
+
+                // Soft expander (NOT hard gate) to avoid clicks: y = x * (|x|/thr)^alpha for |x|<thr
+                const thr = 0.012; // ~ -38dBFS
+                const alpha = 0.6;
+                for (let i = 0; i < floatData.length; i++) {
+                    const x = floatData[i];
+                    const ax = Math.abs(x);
+                    if (ax < thr) {
+                        const scale = Math.pow(ax / thr, alpha);
+                        floatData[i] = x * scale; // smoothly push toward 0
                     }
-                    
-                    // Apply gentle limiting to prevent distortion
-                    if (sample > 0.95) sample = 0.95;
-                    if (sample < -0.95) sample = -0.95;
-                    
-                    channelData[i] = sample;
                 }
-                
-                // Second pass: apply simple moving average for noise reduction
-                const windowSize = 3; // Small window to preserve speech quality
-                const smoothedData = new Float32Array(channelData.length);
-                
-                for (let i = 0; i < channelData.length; i++) {
-                    let sum = 0;
-                    let count = 0;
-                    
-                    // Calculate moving average
-                    for (let j = Math.max(0, i - windowSize); j <= Math.min(channelData.length - 1, i + windowSize); j++) {
-                        sum += channelData[j];
-                        count++;
+
+                // 5. Resample (linear) if needed
+                let resampled;
+                if (srcRate !== targetSampleRate) {
+                    const ratio = targetSampleRate / srcRate;
+                    const newLen = Math.round(floatData.length * ratio);
+                    resampled = new Float32Array(newLen);
+                    for (let i = 0; i < newLen; i++) {
+                        const srcPos = i / ratio;
+                        const i0 = Math.floor(srcPos);
+                        const frac = srcPos - i0;
+                        const s0 = floatData[i0] || 0;
+                        const s1 = floatData[i0 + 1] || s0;
+                        resampled[i] = s0 + (s1 - s0) * frac;
                     }
-                    
-                    const average = sum / count;
-                    
-                    // Blend original with smoothed (preserve speech clarity)
-                    smoothedData[i] = channelData[i] * 0.7 + average * 0.3;
+                } else {
+                    resampled = floatData;
                 }
-                
-                // Copy smoothed data back
-                audioBuffer.copyToChannel(smoothedData, 0);
-                
-                // Apply very gentle fade in/out only at the edges to prevent clicks
-                const fadeLength = Math.min(16, samples.length / 40); // Even smaller fade
-                
-                // Very gentle fade in (only first few samples)
-                for (let i = 0; i < fadeLength; i++) {
-                    const fadeFactor = Math.sin((i / fadeLength) * Math.PI * 0.5); // Smooth sine fade
-                    smoothedData[i] *= fadeFactor;
+
+                // 6. Cross-fade with previous chunk tail to remove discontinuity clicks
+                const fadeSamples = Math.min(
+                    Math.floor((CROSS_FADE_MS / 1000) * targetSampleRate),
+                    Math.floor(resampled.length / 4)
+                );
+
+                if (prevChunkTail && fadeSamples > 8) {
+                    const tailLen = Math.min(prevChunkTail.length, fadeSamples);
+                    for (let i = 0; i < tailLen; i++) {
+                        const fadeIn = (i + 1) / tailLen; // new chunk fade in
+                        const fadeOut = 1 - fadeIn;       // previous tail fade out
+                        const mixed = prevChunkTail[prevChunkTail.length - tailLen + i] * fadeOut + resampled[i] * fadeIn;
+                        resampled[i] = mixed;
+                    }
                 }
-                
-                // Very gentle fade out (only last few samples)
-                for (let i = samples.length - fadeLength; i < samples.length; i++) {
-                    const fadeFactor = Math.sin(((samples.length - i) / fadeLength) * Math.PI * 0.5);
-                    smoothedData[i] *= fadeFactor;
+
+                // 7. Store new tail
+                const tailStoreLen = Math.min(fadeSamples * 2, resampled.length);
+                prevChunkTail = resampled.slice(resampled.length - tailStoreLen);
+
+                // 8. Gentle overall fade edges (very short) to eliminate micro-clicks at capture boundaries
+                const edgeFade = Math.min(16, Math.floor(resampled.length / 50));
+                for (let i = 0; i < edgeFade; i++) {
+                    const w = i / edgeFade;
+                    resampled[i] *= w;
+                    resampled[resampled.length - 1 - i] *= w;
                 }
-                
-                // Copy final data to buffer
-                audioBuffer.copyToChannel(smoothedData, 0);
-                
-                console.log(`Created clean audio buffer: ${audioBuffer.duration.toFixed(3)}s, ${samples.length} samples`);
+
+                // 9. Create final AudioBuffer in target sample rate
+                const audioBuffer = playbackAudioContext.createBuffer(1, resampled.length, targetSampleRate);
+                audioBuffer.copyToChannel(resampled, 0);
                 return audioBuffer;
-                
-            } catch (error) {
-                console.error('Error creating audio buffer:', error);
+            } catch (e) {
+                console.error('createAudioBufferFromChunk error', e);
                 return null;
             }
         }
 
-        function scheduleAudioBuffer(audioBuffer, startTime) {
+        function scheduleAudioBuffer(audioBuffer, requestedStart) {
             try {
+                // Maintain a minimum lead time to reduce underrun pops
+                const now = playbackAudioContext.currentTime;
+                let startTime = Math.max(requestedStart, now + MIN_LEAD_TIME);
+
                 const source = playbackAudioContext.createBufferSource();
                 source.buffer = audioBuffer;
-                
-                // Add to active sources for tracking
                 activeAudioSources.push(source);
-                
+
+                // Light processing chain (avoid heavy filtering that can introduce phase clicks)
+                const hpf = playbackAudioContext.createBiquadFilter();
+                hpf.type = 'highpass';
+                hpf.frequency.value = 65; // remove ultra low rumble
+
+                const lpf = playbackAudioContext.createBiquadFilter();
+                lpf.type = 'lowpass';
+                lpf.frequency.value = 7800; // gentle smoothing
+
+                const comp = playbackAudioContext.createDynamicsCompressor();
+                comp.threshold.value = -28;
+                comp.knee.value = 18;
+                comp.ratio.value = 3;
+                comp.attack.value = 0.006;
+                comp.release.value = 0.18;
+
+                const gain = playbackAudioContext.createGain();
+                gain.gain.value = noiseReductionEnabled ? 0.9 : 1.0;
+
                 if (noiseReductionEnabled) {
-                    // Create comprehensive audio processing chain for noise reduction
-                    const preGainNode = playbackAudioContext.createGain();
-                    const highPassFilter = playbackAudioContext.createBiquadFilter();
-                    const lowPassFilter = playbackAudioContext.createBiquadFilter();
-                    const notchFilter1 = playbackAudioContext.createBiquadFilter();
-                    const notchFilter2 = playbackAudioContext.createBiquadFilter();
-                    const compressor = playbackAudioContext.createDynamicsCompressor();
-                    const finalGainNode = playbackAudioContext.createGain();
-                    
-                    // Pre-gain for input level control
-                    preGainNode.gain.value = 1.0;
-                    
-                    // High-pass filter to remove low-frequency noise (AC hum, rumble)
-                    highPassFilter.type = 'highpass';
-                    highPassFilter.frequency.setValueAtTime(80, startTime); // Remove below 80Hz
-                    highPassFilter.Q.setValueAtTime(0.7, startTime);
-                    
-                    // Low-pass filter to remove high-frequency noise and artifacts
-                    lowPassFilter.type = 'lowpass';
-                    lowPassFilter.frequency.setValueAtTime(7000, startTime); // Remove above 7kHz
-                    lowPassFilter.Q.setValueAtTime(0.8, startTime);
-                    
-                    // Notch filters to remove specific noise frequencies
-                    // Remove 50Hz/60Hz electrical hum
-                    notchFilter1.type = 'notch';
-                    notchFilter1.frequency.setValueAtTime(60, startTime); // 60Hz hum
-                    notchFilter1.Q.setValueAtTime(10, startTime); // Narrow notch
-                    
-                    // Remove high-frequency whine/noise
-                    notchFilter2.type = 'notch';
-                    notchFilter2.frequency.setValueAtTime(15000, startTime); // High frequency noise
-                    notchFilter2.Q.setValueAtTime(5, startTime);
-                    
-                    // Dynamic compressor for noise gating and smooth levels
-                    compressor.threshold.setValueAtTime(-35, startTime); // Lower threshold for noise gating
-                    compressor.knee.setValueAtTime(15, startTime);
-                    compressor.ratio.setValueAtTime(4, startTime); // Moderate compression
-                    compressor.attack.setValueAtTime(0.005, startTime); // Fast attack for noise
-                    compressor.release.setValueAtTime(0.2, startTime); // Slower release for smooth speech
-                    
-                    // Final gain control
-                    finalGainNode.gain.value = 0.85; // Slightly lower to prevent clipping after processing
-                    
-                    // Connect the complete audio processing chain
-                    source.connect(preGainNode);
-                    preGainNode.connect(highPassFilter);
-                    highPassFilter.connect(notchFilter1);
-                    notchFilter1.connect(lowPassFilter);
-                    lowPassFilter.connect(notchFilter2);
-                    notchFilter2.connect(compressor);
-                    compressor.connect(finalGainNode);
-                    finalGainNode.connect(playbackAudioContext.destination);
-                    
-                    source.onended = () => {
-                        // Remove from active sources
-                        const index = activeAudioSources.indexOf(source);
-                        if (index > -1) {
-                            activeAudioSources.splice(index, 1);
-                        }
-                        
-                        // Clean up all nodes
-                        try {
-                            source.disconnect();
-                            preGainNode.disconnect();
-                            highPassFilter.disconnect();
-                            lowPassFilter.disconnect();
-                            notchFilter1.disconnect();
-                            notchFilter2.disconnect();
-                            compressor.disconnect();
-                            finalGainNode.disconnect();
-                        } catch (e) {
-                            // Already disconnected
-                        }
-                    };
+                    source.connect(hpf); hpf.connect(lpf); lpf.connect(comp); comp.connect(gain); gain.connect(playbackAudioContext.destination);
                 } else {
-                    // Simple processing chain without noise reduction
-                    const gainNode = playbackAudioContext.createGain();
-                    gainNode.gain.value = 0.9;
-                    
-                    source.connect(gainNode);
-                    gainNode.connect(playbackAudioContext.destination);
-                    
-                    source.onended = () => {
-                        // Remove from active sources
-                        const index = activeAudioSources.indexOf(source);
-                        if (index > -1) {
-                            activeAudioSources.splice(index, 1);
-                        }
-                        
-                        // Clean up
-                        try {
-                            source.disconnect();
-                            gainNode.disconnect();
-                        } catch (e) {
-                            // Already disconnected
-                        }
-                    };
+                    source.connect(gain); gain.connect(playbackAudioContext.destination);
                 }
-                
-                console.log(`Scheduling ${noiseReductionEnabled ? 'clean' : 'raw'} audio buffer at time ${startTime.toFixed(3)}, duration ${audioBuffer.duration.toFixed(3)}s`);
-                
-                // Schedule the audio to start at the specified time
+
                 source.start(startTime);
-                
-            } catch (error) {
-                console.error('Error scheduling audio buffer:', error);
+                source.onended = () => {
+                    const idx = activeAudioSources.indexOf(source);
+                    if (idx > -1) activeAudioSources.splice(idx, 1);
+                    try { source.disconnect(); hpf.disconnect(); lpf.disconnect(); comp.disconnect(); gain.disconnect(); } catch (_) {}
+                };
+            } catch (e) {
+                console.error('scheduleAudioBuffer error', e);
             }
         }
         
@@ -1269,6 +1279,30 @@
             message.textContent = text;
             chatContainer.appendChild(message);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function appendAgentTranscript(text, isAudio) {
+            if (!text) return;
+            const list = document.getElementById('agentTranscriptList');
+            if (!list) return;
+            const line = document.createElement('div');
+            line.className = 'agent-line';
+            const ts = new Date();
+            const timeStr = ts.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+            line.innerHTML = `${isAudio ? '🔊' : '💬'} ${escapeHtml(text)}<time>${timeStr}</time>`;
+            list.appendChild(line);
+            list.scrollTop = list.scrollHeight;
+        }
+
+        function clearAgentTranscript() {
+            const list = document.getElementById('agentTranscriptList');
+            if (list) list.innerHTML = '';
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/[&<>"']/g, function(c){
+                return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]);
+            });
         }
         
         // Initialize when page loads
