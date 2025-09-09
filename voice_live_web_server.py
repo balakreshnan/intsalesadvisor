@@ -52,22 +52,22 @@ class WebVoiceLiveSession:
     
     def __init__(self, session_id: str):
         """Initialize state for a single web client session."""
-        self.session_id: str = session_id
-        self.connection: VoiceLiveConnection | None = None
+        self.session_id = session_id
+        self.connection = None
         self.audio_player = AudioPlayerAsync()
-        self.is_active: bool = False
-        self.response_in_progress: bool = False
+        self.is_active = False
+        self.response_in_progress = False
 
         # Audio delta aggregation for smoother client playback
-        self._audio_delta_accum: list[str] = []      # base64 delta fragments
-        self._audio_accum_bytes: int = 0             # accumulated decoded bytes
-        self._audio_first_delta_time: float | None = None
+        self._audio_delta_accum = []      # base64 delta fragments
+        self._audio_accum_bytes = 0       # accumulated decoded bytes
+        self._audio_first_delta_time = None
 
         # Tunable aggregation parameters (can be adjusted for latency vs smoothness)
-        self.AGG_TARGET_MS: int = 120        # desired buffered duration before emit
-        self.AGG_MAX_WAIT_MS: int = 70       # max wait after first small chunk
-        self.AGG_MAX_BYTES: int = (24000 // 1000) * 2 * 160  # ~160ms @24kHz 16-bit mono
-        self._assumed_sample_rate: int = 24000
+        self.AGG_TARGET_MS = int(os.getenv("VOICE_AGG_TARGET_MS", "140"))  # desired buffered ms before emit
+        self.AGG_MAX_WAIT_MS = int(os.getenv("VOICE_AGG_MAX_WAIT_MS", "80"))  # max wait after first small chunk
+        self.AGG_MAX_BYTES = (24000 // 1000) * 2 * 200  # up to ~200ms @24kHz 16-bit mono
+        self._assumed_sample_rate = int(os.getenv("VOICE_ASSUMED_SAMPLE_RATE", "24000"))
         
     def start_session(self):
         """Initialize Voice Live API connection"""
