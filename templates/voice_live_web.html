@@ -309,6 +309,7 @@
             <button id="resetButton" onclick="resetState()" style="display: none;">🔄 Reset</button>
             <button id="testAudioButton" onclick="testAudio()" style="background: #FF9800;">🔊 Test Audio</button>
             <button id="noiseReductionButton" onclick="toggleNoiseReduction()" style="background: #4CAF50;">🔇 Noise Filter: ON</button>
+            <button id="qualityModeButton" onclick="toggleQualityMode()" style="background:#2196F3;">🎚️ Quality: HIGH</button>
         </div>
         
         <div class="controls">
@@ -365,7 +366,8 @@
         let audioChunkQueue = []; // Queue for ordered audio chunk playback
         let nextScheduledTime = 0; // Next time to schedule audio
         let currentResponseId = 0; // ID for current response
-        let noiseReductionEnabled = true; // Enable noise reduction by default
+    let noiseReductionEnabled = true; // Enable noise reduction by default
+    let highQualityMode = true; // High quality processing (cubic resample + de-esser)
     // New smoothing helpers
     let prevChunkTail = null; // Tail samples from previous chunk for cross-fade
     let targetSampleRate = null; // Will adopt AudioContext sample rate (often 48000) to avoid per-chunk resample artifacts
@@ -693,6 +695,22 @@
                 button.style.background = '#FF5722';
                 console.log('Noise reduction disabled');
             }
+        }
+
+        // Toggle quality mode (between high fidelity and low latency)
+        function toggleQualityMode() {
+            highQualityMode = !highQualityMode;
+            const btn = document.getElementById('qualityModeButton');
+            if (highQualityMode) {
+                btn.textContent = '🎚️ Quality: HIGH';
+                btn.style.background = '#2196F3';
+                prebufferSeconds = Math.max(prebufferSeconds, 0.45);
+            } else {
+                btn.textContent = '⚡ Quality: LOW';
+                btn.style.background = '#9E9E9E';
+                prebufferSeconds = 0.25;
+            }
+            console.log('Quality mode switched to', highQualityMode ? 'HIGH' : 'LOW');
         }
         
         // Toggle microphone recording
@@ -1053,22 +1071,61 @@
                     }
                 }
 
-                // 5. Resample (linear) if needed
+                // 5. Resample (cubic Hermite in HQ mode; linear otherwise)
                 let resampled;
                 if (srcRate !== targetSampleRate) {
                     const ratio = targetSampleRate / srcRate;
                     const newLen = Math.round(floatData.length * ratio);
                     resampled = new Float32Array(newLen);
-                    for (let i = 0; i < newLen; i++) {
-                        const srcPos = i / ratio;
-                        const i0 = Math.floor(srcPos);
-                        const frac = srcPos - i0;
-                        const s0 = floatData[i0] || 0;
-                        const s1 = floatData[i0 + 1] || s0;
-                        resampled[i] = s0 + (s1 - s0) * frac;
+                    if (highQualityMode) {
+                        for (let i = 0; i < newLen; i++) {
+                            const srcPos = i / ratio;
+                            const i1 = Math.floor(srcPos);
+                            const t = srcPos - i1;
+                            const i0 = i1 - 1;
+                            const i2 = i1 + 1;
+                            const i3 = i1 + 2;
+                            const y0 = floatData[i0] !== undefined ? floatData[i0] : floatData[i1] || 0;
+                            const y1 = floatData[i1] !== undefined ? floatData[i1] : y0;
+                            const y2 = floatData[i2] !== undefined ? floatData[i2] : y1;
+                            const y3 = floatData[i3] !== undefined ? floatData[i3] : y2;
+                            const t2 = t * t; const t3 = t2 * t;
+                            const a = -0.5*y0 + 1.5*y1 - 1.5*y2 + 0.5*y3;
+                            const b = y0 - 2.5*y1 + 2*y2 - 0.5*y3;
+                            const c = -0.5*y0 + 0.5*y2;
+                            const d = y1;
+                            let sample = a*t3 + b*t2 + c*t + d;
+                            sample += (Math.random() + Math.random() - 1) * 1e-5; // mild dithering
+                            resampled[i] = Math.max(-1, Math.min(1, sample));
+                        }
+                    } else {
+                        for (let i = 0; i < newLen; i++) {
+                            const srcPos = i / ratio;
+                            const i0 = Math.floor(srcPos);
+                            const frac = srcPos - i0;
+                            const s0 = floatData[i0] || 0;
+                            const s1 = floatData[i0 + 1] || s0;
+                            resampled[i] = s0 + (s1 - s0) * frac;
+                        }
                     }
                 } else {
                     resampled = floatData;
+                }
+
+                // 5b. Dynamic de-esser (HQ only)
+                if (highQualityMode) {
+                    let lp = 0;
+                    const alpha = Math.min(0.25, 5000 / targetSampleRate); // ~5kHz one-pole LP
+                    for (let i = 0; i < resampled.length; i++) {
+                        const x = resampled[i];
+                        lp += alpha * (x - lp);
+                        const hi = x - lp;
+                        const ahi = Math.abs(hi);
+                        if (ahi > 0.12) {
+                            const reduce = Math.min(0.45, (ahi - 0.12) * 1.8);
+                            resampled[i] = x - hi * reduce;
+                        }
+                    }
                 }
 
                 // 6. Cross-fade with previous chunk tail to remove discontinuity clicks
@@ -1126,7 +1183,7 @@
 
                 const lpf = playbackAudioContext.createBiquadFilter();
                 lpf.type = 'lowpass';
-                lpf.frequency.value = 7800; // gentle smoothing
+                lpf.frequency.value = highQualityMode ? 12000 : 7800; // wider band in HQ mode
 
                 const comp = playbackAudioContext.createDynamicsCompressor();
                 comp.threshold.value = -28;
