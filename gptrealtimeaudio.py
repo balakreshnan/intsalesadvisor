@@ -89,14 +89,23 @@ async def main() -> None:
 
         await connection.session.update(session={
             "output_modalities": ["text", "audio"],
-            "instructions": "You are a helpful sales advisor for tech gadgets. Use the get_local_context tool to fetch specific product details when a user asks about items like earbuds, laptops, or phones. Incorporate the returned info into your response conversationally.",
+            "instructions": """You are a helpful sales advisor for tech gadgets. 
+
+            IMPORTANT RULES:
+            - You MUST call the 'get_local_context' tool for EVERY user query to fetch the specific context.
+            - Use the tool's query parameter with a concise summary of the user's question (e.g., 'earbuds' or 'laptop features').
+            - Do NOT respond or generate any answer until you have received the tool's result.
+            - Base your ENTIRE response ONLY on the information returned by the tool. Do not use any external knowledge, general facts, or assumptions.
+            - If the tool returns 'default' context, use that to guide a general response but still reference it explicitly.
+            - Keep responses conversational, friendly, and under 100 words.
+            - After incorporating the tool result, end your turn naturally.""",
             "tools": [get_context_tool],  # Enable the tool
-            "tool_choice": "auto",  # Model decides when to call; set to {"type": "function", "function": {"name": "get_local_context"}} to force
+            "tool_choice": {"type": "function", "function": {"name": "get_local_context"}},  # FORCE tool call for every turn
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.5,
                 "prefix_padding_ms": 300,
-                "silence_duration_ms": 500
+                "silence_duration_ms": 800  # Increased to 800ms for longer silence detection after response
             }
         })
 
@@ -161,8 +170,10 @@ async def main() -> None:
                         try:
                             args = json.loads(tool_call["arguments"])
                             query = args.get("query", "")
+                            print(f"🔍 Tool called with query: '{query}'")  # Debug log
                             if tool_call["name"] == "get_local_context":
                                 result = get_local_context(query)
+                                print(f"📄 Tool result: {result}")  # Debug log
                                 # Send back the result as a function return item
                                 await connection.conversation.item.create(
                                     item={
@@ -178,8 +189,11 @@ async def main() -> None:
 
                 elif event.type == "response.done":
                     handle_response_done(event)
-                    print("✅ Ready for next input\n")
-                    # Continue listening (no break)
+                    print("✅ Response complete. Waiting for your next input...\n")
+                    # Add a brief pause to allow silence after response and prevent false triggers
+                    # (e.g., due to audio bleed or ambient noise)
+                    await asyncio.sleep(1.5)  # 1.5 second pause before resuming full listening
+                    # Note: Input stream continues, but this sleep gives time for VAD to settle
 
         except KeyboardInterrupt:
             print("\n🛑 Stopping...")
