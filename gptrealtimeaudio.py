@@ -92,7 +92,7 @@ async def main() -> None:
             "instructions": """You are a helpful sales advisor for tech gadgets. 
 
             IMPORTANT RULES:
-            - You MUST call the 'get_local_context' tool for EVERY user query to fetch the specific context.
+            - You MUST call the 'get_local_context' tool for EVERY user query
             - Use the tool's query parameter with a concise summary of the user's question (e.g., 'earbuds' or 'laptop features').
             - Do NOT respond or generate any answer until you have received the tool's result.
             - Base your ENTIRE response ONLY on the information returned by the tool. Do not use any external knowledge, general facts, or assumptions.
@@ -150,6 +150,24 @@ async def main() -> None:
                     print(event.delta, flush=True, end="")
 
                 elif event.type == "response.audio_transcript.done":
+                    user_query = event.transcript
+                    print(f"🎤 User said: {user_query}")
+
+                    # Force local context lookup
+                    context_result = get_local_context(user_query)
+                    print(f"📄 Forced context: {context_result}")
+
+                    # Send as function return
+                    await connection.conversation.item.create(
+                        item={
+                            "type": "function_call_return",
+                            "call_id": "forced_context",  # any ID
+                            "result": context_result
+                        }
+                    )
+
+                    # Now tell the model to generate from that context only
+                    await connection.response.create()
                     print()
 
                 elif event.type == "response.function_call_arguments.delta":
@@ -188,7 +206,7 @@ async def main() -> None:
                         await connection.response.create()
 
                 elif event.type == "response.done":
-                    handle_response_done(event)
+                    # handle_response_done(event)
                     print("✅ Response complete. Waiting for your next input...\n")
                     # Add a brief pause to allow silence after response and prevent false triggers
                     # (e.g., due to audio bleed or ambient noise)
