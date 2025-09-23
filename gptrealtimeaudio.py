@@ -2,6 +2,7 @@ import os
 import base64
 import asyncio
 import sys
+import json
 from openai import AsyncAzureOpenAI
 import numpy as np
 import sounddevice as sd
@@ -33,12 +34,27 @@ def handle_response_done(event):
     print(f" Audio output tokens: {usage.output_token_details.audio_tokens}")
     print(f" Text output tokens: {usage.output_token_details.text_tokens}")
 
-# Add this function before main()
-def get_dynamic_context(topic: str) -> str:
-    # Simulate fetching from a DB/file; replace with real logic
-    if topic == "earbuds":
-        return "You are advising on earbuds. Key facts: Model XYZ, $99, Bluetooth 5.0, sweat-resistant."
-    return "General sales advisor context: Be friendly and informative."
+
+# Define a local function that takes a text string (query) and returns some content
+def get_local_context(query: str) -> str:
+    """
+    Local function to provide context based on a text query.
+    This is a simple example; expand it as needed (e.g., check against a dict, file, or compute dynamically).
+    """
+    context_map = {
+        "earbuds": "Wireless Earbuds: Price $99, Features: Noise-cancelling, 20-hour battery, Bluetooth 5.0. Great for workouts!",
+        "laptop": "Gaming Laptop: Intel i7, 16GB RAM, RTX 3060 GPU, 512GB SSD. Ideal for gaming and productivity.",
+        "phone": "Smartphone: 6.1-inch OLED, 128GB storage, Triple camera. Runs latest OS with excellent battery life.",
+        "default": "General knowledge: We're a tech store specializing in gadgets. Ask about products for more details!"
+    }
+    
+    # Simple keyword matching; in production, use regex, fuzzy search, etc.
+    query_lower = query.lower()
+    for key in context_map:
+        if key in query_lower:
+            return context_map[key]
+    return context_map["default"]
+
 
 async def main() -> None:
     client = AsyncAzureOpenAI(
@@ -47,8 +63,6 @@ async def main() -> None:
         api_version="2024-10-01-preview",
     )
 
-    dynamic_instructions = get_dynamic_context("earbuds")  # Call your functio
-
     # Open a sounddevice output stream (24kHz mono)
     stream = sd.OutputStream(samplerate=24000, channels=1, dtype="int16")
     stream.start()
@@ -56,9 +70,28 @@ async def main() -> None:
     async with client.beta.realtime.connect(
         model="gpt-realtime",
     ) as connection:
+        # Define the tool schema for the local function
+        get_context_tool = {
+            "type": "function",
+            "name": "get_local_context",
+            "description": "Call this to retrieve relevant context or knowledge from the local store based on a query string.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The text query to fetch context for (e.g., 'earbuds features')."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+
         await connection.session.update(session={
             "output_modalities": ["text", "audio"],
-            "instructions": dynamic_instructions,
+            "instructions": "You are a helpful sales advisor for tech gadgets. Use the get_local_context tool to fetch specific product details when a user asks about items like earbuds, laptops, or phones. Incorporate the returned info into your response conversationally.",
+            "tools": [get_context_tool],  # Enable the tool
+            "tool_choice": "auto",  # Model decides when to call; set to {"type": "function", "function": {"name": "get_local_context"}} to force
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.5,
@@ -93,7 +126,9 @@ async def main() -> None:
         )
         input_stream.start()
 
-        print("🔴 Listening for audio input... Speak now! (Ctrl+C to quit)")
+        print("🔴 Listening for audio input... Speak now! (e.g., 'Tell me about earbuds') (Ctrl+C to quit)")
+
+        pending_tool_calls = {}  # Track ongoing tool calls (deltas)
 
         try:
             async for event in connection:
@@ -107,6 +142,39 @@ async def main() -> None:
 
                 elif event.type == "response.audio_transcript.done":
                     print()
+
+                elif event.type == "response.function_call_arguments.delta":
+                    # Accumulate function call arguments (sent in deltas)
+                    call_id = event.call_id
+                    if call_id not in pending_tool_calls:
+                        pending_tool_calls[call_id] = {
+                            "name": event.name,
+                            "arguments": ""
+                        }
+                    pending_tool_calls[call_id]["arguments"] += event.delta
+
+                elif event.type == "response.function_call.done":
+                    # Tool call is complete; execute and return
+                    call_id = event.call_id
+                    tool_call = pending_tool_calls.pop(call_id, None)
+                    if tool_call:
+                        try:
+                            args = json.loads(tool_call["arguments"])
+                            query = args.get("query", "")
+                            if tool_call["name"] == "get_local_context":
+                                result = get_local_context(query)
+                                # Send back the result as a function return item
+                                await connection.conversation.item.create(
+                                    item={
+                                        "type": "function_call_return",
+                                        "call_id": call_id,
+                                        "result": result
+                                    }
+                                )
+                        except json.JSONDecodeError:
+                            print(f"Error parsing tool args for call {call_id}", file=sys.stderr)
+                        # Trigger the model to continue generating response with tool result
+                        await connection.response.create()
 
                 elif event.type == "response.done":
                     handle_response_done(event)
